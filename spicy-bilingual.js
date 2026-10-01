@@ -72,7 +72,7 @@
 
   .sb-btn.sm{width:32px;height:32px;font-size:18px;line-height:1}
   #sb-src{font-size:12px;opacity:.6;margin-top:6px;line-height:1.4}
-  #sb-key{background:#0d0d0d;color:#fff;border:1px solid rgba(255,255,255,.2);border-radius:8px;padding:8px 10px}
+  #sb-key{-webkit-text-security:disc;background:#0d0d0d;color:#fff;border:1px solid rgba(255,255,255,.2);border-radius:8px;padding:8px 10px}
 
   /* Letra */
   #sb-scroll{position:relative;z-index:1;flex:1;min-width:0;overflow-y:auto;padding:45vh 5vw;scrollbar-width:none}
@@ -144,7 +144,7 @@
         <div id="sb-sw"></div>
         <div class="sb-row"><span>Sincronía <small style="opacity:.6">(+ adelanta la letra)</small></span><span style="display:flex;align-items:center;gap:8px"><button class="sb-btn sm" id="sb-offm">−</button><span id="sb-off" style="min-width:64px;text-align:center">0 ms</span><button class="sb-btn sm" id="sb-offp">+</button></span></div>
         <label class="sb-row"><span>Desenfocar líneas lejanas</span><input type="checkbox" id="sb-m-blur"></label>
-        <div class="sb-row" style="flex-direction:column;align-items:stretch;gap:6px"><span>Clave API de Spicy Lyrics <small style="opacity:.6">(opcional: letra palabra por palabra)</small></span><input id="sb-key" type="password" placeholder="sl_pk_..." autocomplete="off" spellcheck="false"><small style="opacity:.6">Gratis en developers.spicylyrics.org. Cada persona debe usar su propia clave.</small></div>
+        <div class="sb-row" style="flex-direction:column;align-items:stretch;gap:6px"><span>Clave API de Spicy Lyrics <small style="opacity:.6">(opcional: letra palabra por palabra)</small></span><div style="display:flex;gap:8px"><input id="sb-key" type="text" placeholder="sl_pk_..." autocomplete="off" spellcheck="false" style="flex:1;min-width:0"><button class="sb-btn" id="sb-keypaste" style="width:auto;border-radius:8px;padding:0 14px;font-size:13px">Pegar</button></div><div id="sb-keystatus" style="font-size:13px;min-height:18px;font-weight:600"></div><small style="opacity:.6">Gratis en developers.spicylyrics.org. Cada persona debe usar su propia clave.</small></div>
         <button id="sb-done">Listo</button>
       </div>
     </div>`;
@@ -181,13 +181,45 @@
   const setOff = (v) => { offset = v; if (loadedId) store.set("o:" + loadedId, v); showOff(); };
   $("#sb-offm").addEventListener("click", () => setOff(offset - 100));
   $("#sb-offp").addEventListener("click", () => setOff(offset + 100));
-  $("#sb-key").value = S.apiKey;
-  $("#sb-key").addEventListener("change", (e) => {
-    S.apiKey = e.target.value.trim();
-    store.set("apikey", S.apiKey);
+  // Clave de la API: Spotify a veces bloquea Ctrl+V, así que hay botón "Pegar" y lectura manual del portapapeles
+  const keyEl = $("#sb-key");
+  const notify = (m, err) => { try { Spicetify.showNotification(m, !!err); } catch {} };
+  keyEl.value = S.apiKey;
+  { const ks = store.get("keystate", null); if (S.apiKey && ks) setKeyStatus(ks.kind, ks.msg); }
+  function saveKey() {
+    const v = keyEl.value.trim();
+    if (v.startsWith("sl_sk_")) {
+      keyEl.value = "";
+      notify("Esa es la clave secreta. Usa la clave pública (sl_pk_...).", true);
+      return;
+    }
+    S.apiKey = v;
+    store.set("apikey", v);
     loadedId = null;
+    if (v) { notify("Clave guardada"); testKey(); } else setKeyStatus("", "");
     if (isOpen) load();
-  });
+  }
+  async function readClip() {
+    try { const t = await Spicetify.Platform?.ClipboardAPI?.paste?.(); if (typeof t === "string" && t) return t; } catch {}
+    try { return await navigator.clipboard.readText(); } catch {}
+    return "";
+  }
+  async function pasteKey() {
+    const t = (await readClip()).trim();
+    if (!t) { notify("No pude leer el portapapeles. Escribe la clave a mano.", true); return; }
+    keyEl.value = t;
+    saveKey();
+  }
+  keyEl.addEventListener("change", saveKey);
+  keyEl.addEventListener("keydown", (e) => { e.stopPropagation(); if (e.key === "Enter") keyEl.blur(); });
+  $("#sb-keypaste").addEventListener("click", pasteKey);
+  window.addEventListener("keydown", (e) => {
+    if (e.target === keyEl && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v") {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      pasteKey();
+    }
+  }, true);
   $("#sb-done").addEventListener("click", () => $("#sb-modal").classList.remove("open"));
   $("#sb-modal").addEventListener("click", (e) => { if (e.target.id === "sb-modal") $("#sb-modal").classList.remove("open"); });
   $("#sb-trbtn").addEventListener("click", () => $("#sb-modal").classList.add("open"));
@@ -321,23 +353,108 @@
   }
   // </parseSpicy>
 
-  async function fetchSpicy(id) {
-    if (!S.apiKey) return null;
+  // Petición desde un iframe con sandbox: el navegador le asigna Origin "null"
+  function fetchViaSandbox(url, headers) {
+    return new Promise((resolve) => {
+      const id = "sb" + Math.random().toString(36).slice(2);
+      const f = document.createElement("iframe");
+      f.setAttribute("sandbox", "allow-scripts");
+      f.style.cssText = "display:none;width:0;height:0;border:0";
+      let done = false;
+      const finish = (v) => { if (done) return; done = true; window.removeEventListener("message", on); clearTimeout(tm); f.remove(); resolve(v); };
+      const on = (ev) => { if (ev.source === f.contentWindow && ev.data?.id === id) finish(ev.data); };
+      const tm = setTimeout(() => finish({ status: 0, err: "tiempo agotado" }), 7000);
+      window.addEventListener("message", on);
+      f.srcdoc = "<script>(async()=>{const id=" + JSON.stringify(id) + ";try{const r=await fetch(" + JSON.stringify(url) +
+        ",{headers:" + JSON.stringify(headers) + "});let b=null;try{b=await r.json()}catch(e){}parent.postMessage({id:id,status:r.status,body:b},'*')}catch(e){parent.postMessage({id:id,status:0,err:String(e).slice(0,80)},'*')}})()<\/script>";
+      document.body.appendChild(f);
+    });
+  }
+
+  // Una petición a la API; devuelve el código HTTP (0 = sin conexión), la letra si la hay y un diagnóstico
+  async function apiCall(id) {
     const url = `https://api.spicylyrics.org/v1/lyrics/${id}`;
     const headers = { Authorization: "Bearer " + S.apiKey };
-    let res = null, err = null;
-    // Cosmos no envía cabecera Origin (la clave debe permitir "sin Origin", solo para Spicetify)
-    try { res = await Spicetify.CosmosAsync.get(url, undefined, headers); } catch (e) { err = e; }
-    if (!res || (!res.Body && !res.Content)) {
+    const pick = (j) => {
+      if (typeof j === "string") { try { j = JSON.parse(j); } catch { return null; } }
+      return j?.Body ?? (j?.Content ? j : null);
+    };
+    const describe = (e) => String(e?.status ?? e?.code ?? e?.statusCode ?? e?.message ?? e?.name ?? e).split(url).join("<url>").slice(0, 170);
+    const diag = [];
+    let cosStatus = null;
+    // Si el iframe ya funcionó antes, vamos directo (evita peticiones rechazadas de las otras vías)
+    if (store.get("route", "") === "iframe") {
       try {
-        const r = await fetch(url, { headers });
-        if (r.ok) res = await r.json(); else err = { status: r.status };
-      } catch (e) { err = err || e; }
+        const r = await fetchViaSandbox(url, headers);
+        const body = r.status === 200 ? pick(r.body) : null;
+        if (body) return { status: 200, body, diag: "" };
+        if ([401, 404, 429].includes(r.status)) return { status: r.status, diag: "iframe: " + r.status };
+      } catch {}
+      store.set("route", ""); // la vía rápida falló: probamos todas de nuevo
     }
-    const body = res?.Body ?? (res?.Content ? res : null);
+    // 1) Cosmos (vía nativa de Spotify, sin cabecera Origin: es lo que pide la clave "No Origin header")
+    try {
+      const body = pick(await Spicetify.CosmosAsync.get(url, null, headers));
+      if (body) return { status: 200, body, diag: "" };
+      diag.push("Cosmos: respuesta sin letra");
+    } catch (e) {
+      diag.push("Cosmos: " + describe(e));
+      const n = Number(e?.status ?? e?.code ?? e?.statusCode);
+      if (Number.isFinite(n) && n >= 400) cosStatus = n;
+    }
+    // 2) iframe aislado: su Origin es "null" (hay que agregar null en Allowed origins del panel)
+    try {
+      const r = await fetchViaSandbox(url, headers);
+      const body = r.status === 200 ? pick(r.body) : null;
+      if (body) { store.set("route", "iframe"); return { status: 200, body, diag: "" }; }
+      diag.push("iframe: " + (r.status || r.err || "sin respuesta"));
+      if ([401, 404, 429].includes(r.status)) return { status: r.status, diag: diag.join(" · ") };
+    } catch (e) { diag.push("iframe: " + describe(e)); }
+    // 3) fetch normal (lleva el Origin de Spotify, solo sirve si la clave lo permite)
+    try {
+      const r = await fetch(url, { headers });
+      if (r.ok) return { status: 200, body: pick(await r.json()), diag: "" };
+      diag.push("fetch: " + r.status);
+      return { status: r.status, diag: diag.join(" · ") };
+    } catch (e) {
+      diag.push("fetch: " + describe(e));
+      return { status: cosStatus ?? 0, diag: diag.join(" · ") };
+    }
+  }
+
+  // Mensaje verde / rojo / ámbar en el modal
+  function keyMessage(status, diag) {
+    const d = diag ? " [" + diag + "]" : "";
+    if (status === 200) return ["ok", "✓ Clave funcionando"];
+    if (status === 404) return ["ok", "✓ Clave válida (esa canción no está en su catálogo)"];
+    if (status === 401) return ["bad", "✗ Clave incorrecta (401). Revisa que esté completa." + d];
+    if (status === 403) return ["bad", "✗ Rechazada (403)." + d];
+    if (status === 429) return ["warn", "Clave válida, pero llegó al límite de peticiones (429). Espera un momento."];
+    if (status === 0) return ["bad", "✗ No se pudo conectar con la API." + d];
+    return ["bad", "✗ Error " + status + "." + d];
+  }
+  function setKeyStatus(kind, msg) {
+    const el = $("#sb-keystatus");
+    if (!el) return;
+    el.textContent = msg;
+    el.style.color = { ok: "#1ed760", bad: "#ff6b6b", warn: "#ffd166", wait: "rgba(255,255,255,.7)" }[kind] || "inherit";
+    store.set("keystate", kind ? { kind, msg } : null);
+  }
+  async function testKey() {
+    if (!S.apiKey) return;
+    setKeyStatus("wait", "Verificando…");
+    const id = P.data?.item?.uri?.startsWith("spotify:track:") ? P.data.item.uri.split(":")[2] : "4uLU6hMCjMI75M1A2tKUQC";
+    const { status, diag } = await apiCall(id);
+    setKeyStatus(...keyMessage(status, diag));
+  }
+
+  async function fetchSpicy(id) {
+    if (!S.apiKey) return null;
+    const { status, body, diag } = await apiCall(id);
+    setKeyStatus(...keyMessage(status, diag));
     if (!body?.Content?.length) {
-      apiNote = err ? "API Spicy: error " + (err.status ?? err.code ?? "de red") : "API Spicy: sin letra";
-      console.warn("[SpicyBilingual] API Spicy:", err || "sin contenido");
+      apiNote = status === 200 || status === 404 ? "API Spicy: sin letra" : "API Spicy: error " + (status || "de red");
+      console.warn("[SpicyBilingual] API Spicy:", status);
       return null;
     }
     const data = parseSpicy(body);
