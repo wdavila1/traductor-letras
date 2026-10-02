@@ -1,7 +1,12 @@
 // Spicy Bilingual v3 - Letra karaoke + traducción (EN <-> ES) en otro color
 (async function SpicyBilingual() {
-  while (!(window.Spicetify?.Player && Spicetify.Playbar && Spicetify.CosmosAsync)) {
+  // Espera (máx. ~30 s) a que Spicetify y la página estén listos; ya no exige piezas opcionales
+  for (let i = 0; i < 100 && !(window.Spicetify?.Player && Spicetify.Platform && document.body); i++) {
     await new Promise((r) => setTimeout(r, 300));
+  }
+  if (!window.Spicetify?.Player || !document.body) {
+    console.error("[SpicyBilingual] Spicetify.Player no está disponible; la extensión no se cargó.");
+    return;
   }
 
   // ---------- Ajustes ----------
@@ -300,7 +305,7 @@
   }
 
   async function fetchLrclib(item) {
-    const name = item.name, artist = item.artists?.[0]?.name || "";
+    const name = itemName(item), artist = itemArtists(item)[0] || "";
     const dur = Math.round(P.getDuration() / 1000);
     try {
       let r = await fetch("https://lrclib.net/api/get?" + new URLSearchParams({ track_name: name, artist_name: artist, duration: dur }));
@@ -443,7 +448,8 @@
   async function testKey() {
     if (!S.apiKey) return;
     setKeyStatus("wait", "Verificando…");
-    const id = P.data?.item?.uri?.startsWith("spotify:track:") ? P.data.item.uri.split(":")[2] : "4uLU6hMCjMI75M1A2tKUQC";
+    const cur = currentItem();
+    const id = cur?.uri?.startsWith("spotify:track:") ? cur.uri.split(":")[2] : "4uLU6hMCjMI75M1A2tKUQC";
     const { status, diag } = await apiCall(id);
     setKeyStatus(...keyMessage(status, diag));
   }
@@ -575,17 +581,40 @@
     if (apiNote) add((lyricsSrc ? " · " : "") + apiNote);
   }
 
+  // La forma de leer la canción actual cambia entre versiones de Spotify/Spicetify: probamos varias
+  function currentItem() {
+    const PA = Spicetify.Platform?.PlayerAPI;
+    let st2 = null;
+    try { st2 = PA?.getState?.(); } catch {}
+    for (const d of [P.data, PA?._state, st2]) {
+      const it = d?.item ?? d?.track;
+      if (it?.uri) return it;
+    }
+    return null;
+  }
+  const itemName = (it) => it.name || it.metadata?.title || "";
+  const itemArtists = (it) => (it.artists?.length ? it.artists.map((a) => a.name) : it.metadata?.artist_name ? [it.metadata.artist_name] : []);
+  function itemImage(it) {
+    const im = it.images || it.album?.images || [];
+    const big = im.find((x) => /large/i.test(x.label || "")) || im[0];
+    const u = it.metadata?.image_xlarge_url || it.metadata?.image_url || big?.url || "";
+    return u.replace("spotify:image:", "https://i.scdn.co/image/");
+  }
+  let shownUri;
+
   function setHeader(item) {
-    $("#sb-title").textContent = item.name || "";
-    $("#sb-artist").textContent = item.artists?.map((a) => a.name).join(", ") || "";
-    const img = (item.metadata?.image_xlarge_url || item.metadata?.image_url || "").replace("spotify:image:", "https://i.scdn.co/image/");
+    $("#sb-title").textContent = itemName(item);
+    $("#sb-artist").textContent = itemArtists(item).join(", ");
+    const img = itemImage(item);
     $("#sb-cover").src = img;
     $("#sb-bg").style.backgroundImage = img ? `url("${img}")` : "none";
   }
 
   async function load() {
-    const item = P.data?.item;
-    if (!item || !item.uri?.startsWith("spotify:track:")) { status("Reproduce una canción para ver su letra."); return; }
+    const item = currentItem();
+    shownUri = item?.uri;
+    if (!item) { status("No pude leer la canción actual de Spotify."); return; }
+    if (!item.uri.startsWith("spotify:track:")) { status("Este contenido no tiene letra (" + item.uri.split(":")[1] + ")."); return; }
     const id = item.uri.split(":")[2];
     setHeader(item);
     refreshCtl();
@@ -703,7 +732,11 @@
     const dur = P.getDuration() || 1;
     $("#sb-fill").style.width = (prog / dur) * 100 + "%";
     const sec = Math.floor(prog / 1000);
-    if (sec !== lastSec) { lastSec = sec; $("#sb-cur").textContent = fmt(prog); }
+    if (sec !== lastSec) {
+      lastSec = sec;
+      $("#sb-cur").textContent = fmt(prog);
+      if (currentItem()?.uri !== shownUri) { loadedId = null; load(); }
+    }
 
     if (!synced || !lines.length || !scroller.children[0]?._w) return;
     const p = prog + LOOKAHEAD_MS + offset;
@@ -731,9 +764,34 @@
 
   P.addEventListener("songchange", () => { if (isOpen) { loadedId = null; load(); } });
 
-  new Spicetify.Playbar.Button(
-    "Letra bilingüe",
-    `<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M2 3h12v1.5H2zM2 7h8v1.5H2zM2 11h12v1.5H2z"/></svg>`,
-    () => toggle()
-  );
+  // Botón: la versión nueva de Spotify a veces acepta crearlo en la barra pero no lo dibuja.
+  // Comprobamos que exista en pantalla y, si no, probamos la barra superior y por último un botón flotante.
+  const BTN_ICON = `<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M2 3h12v1.5H2zM2 7h8v1.5H2zM2 11h12v1.5H2z"/></svg>`;
+  const BTN_LABEL = "Letra bilingüe";
+  const alive = (b) => !!b?.element?.isConnected;
+  let pb = null;
+  try { if (Spicetify.Playbar?.Button) pb = new Spicetify.Playbar.Button(BTN_LABEL, BTN_ICON, () => toggle()); } catch (e) { console.warn("[SpicyBilingual] Playbar:", e); }
+  setTimeout(() => {
+    if (alive(pb)) { console.log("[SpicyBilingual] cargada. Botón en: barra del reproductor"); return; }
+    let tb = null;
+    try { if (Spicetify.Topbar?.Button) tb = new Spicetify.Topbar.Button(BTN_LABEL, BTN_ICON, () => toggle()); } catch (e) { console.warn("[SpicyBilingual] Topbar:", e); }
+    setTimeout(() => {
+      let where = "barra superior";
+      if (!alive(tb)) {
+        where = "botón flotante";
+        const fb = document.createElement("button");
+        fb.className = "sb-btn";
+        fb.title = BTN_LABEL;
+        fb.innerHTML = BTN_ICON;
+        fb.style.cssText = "position:fixed;right:18px;bottom:110px;z-index:9998;background:#1ed760;color:#000;border:0";
+        fb.addEventListener("click", () => toggle());
+        document.body.appendChild(fb);
+      }
+      console.log("[SpicyBilingual] cargada. Botón en:", where);
+      try { Spicetify.showNotification("Letra bilingüe cargada (botón: " + where + ")"); } catch {}
+    }, 1500);
+  }, 2500);
+
+  // Atajo de teclado: Ctrl+Alt+B (Ctrl+Alt+L lo usa el software de AMD)
+  window.addEventListener("keydown", (e) => { if (e.ctrlKey && e.altKey && e.key.toLowerCase() === "b") toggle(); });
 })();
